@@ -15,6 +15,8 @@ use super::{RegionObserver, ObserverContext, Result};
 
 use raftstore::store::PeerStorage;
 use kvproto::raft_cmdpb::{RaftCmdRequest, RaftCmdResponse};
+use util::worker::{Worker, Scheduler};
+use raftstore::store::worker::SnapTask;
 
 struct ObserverEntry {
     priority: u32,
@@ -134,7 +136,9 @@ mod test {
     use tempdir::TempDir;
     use raftstore::store::engine::*;
     use raftstore::store::PeerStorage;
+    use raftstore::store::worker::{SnapRunner, SnapTask};
     use util::HandyRwLock;
+    use util::worker::{Worker, Scheduler};
     use std::sync::*;
     use std::fmt::Debug;
     use protobuf::RepeatedField;
@@ -142,6 +146,12 @@ mod test {
     use kvproto::metapb::Region;
     use kvproto::raft_cmdpb::{AdminRequest, Request, AdminResponse, Response, RaftCmdRequest,
                               RaftCmdResponse};
+
+    fn new_scheduler() -> Scheduler<SnapTask> {
+        let mut snap_worker = Worker::new("snapshot worker");
+        snap_worker.start(SnapRunner).unwrap();
+        snap_worker.scheduler()
+    }
 
     struct TestCoprocessor {
         bypass_pre: Arc<RwLock<bool>>,
@@ -212,9 +222,9 @@ mod test {
         }
     }
 
-    fn new_peer_storage(path: &TempDir) -> PeerStorage {
+    fn new_peer_storage(path: &TempDir, scheduler: Scheduler<SnapTask>) -> PeerStorage {
         let engine = new_engine(path.path().to_str().unwrap()).unwrap();
-        PeerStorage::new(Arc::new(engine), &Region::new()).unwrap()
+        PeerStorage::new(Arc::new(engine), &Region::new(), scheduler).unwrap()
     }
 
     fn share<T>(t: T) -> Arc<RwLock<T>> {
@@ -245,7 +255,8 @@ mod test {
         let mut host = CoprocessorHost::default();
         host.registry.register_observer(3, Box::new(observer1));
         let path = TempDir::new("test-raftstore").unwrap();
-        let ps = new_peer_storage(&path);
+        let scheduler = new_scheduler();
+        let ps = new_peer_storage(&path, scheduler);
         let mut admin_req = RaftCmdRequest::new();
         admin_req.set_admin_request(AdminRequest::new());
         let mut query_req = RaftCmdRequest::new();

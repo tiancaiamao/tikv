@@ -11,7 +11,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::sync::{self, Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
+use std::sync::{self, Arc, RwLock, Mutex, RwLockReadGuard, RwLockWriteGuard};
 use std::vec::Vec;
 use std::{error, mem};
 use std::time::Instant;
@@ -24,8 +24,10 @@ use kvproto::metapb;
 use kvproto::raftpb::{Entry, Snapshot, HardState, ConfState};
 use kvproto::raft_serverpb::{RaftSnapshotData, KeyValue, RaftTruncatedState};
 use util::HandyRwLock;
+use util::worker::Scheduler;
 use raft::{self, Storage, RaftState, StorageError, Error as RaftError, Ready};
 use raftstore::{Result, Error};
+use super::worker::SnapTask;
 use super::keys::{self, enc_start_key, enc_end_key};
 use super::engine::{Peekable, Iterable, Mutable};
 
@@ -56,6 +58,7 @@ pub struct PeerStorage {
     pub truncated_state: RaftTruncatedState,
     pub snap_state: SnapState,
     snap_tried_cnt: u8,
+    scheduler: Mutex<Scheduler<SnapTask>>,
 }
 
 fn storage_error<E>(error: E) -> raft::Error
@@ -84,7 +87,10 @@ pub struct ApplySnapResult {
 }
 
 impl PeerStorage {
-    pub fn new(engine: Arc<DB>, region: &metapb::Region) -> Result<PeerStorage> {
+    pub fn new(engine: Arc<DB>,
+               region: &metapb::Region,
+               scheduler: Scheduler<SnapTask>)
+               -> Result<PeerStorage> {
         let mut store = PeerStorage {
             engine: engine,
             region: region.clone(),
@@ -93,6 +99,7 @@ impl PeerStorage {
             truncated_state: RaftTruncatedState::new(),
             snap_state: SnapState::Relax,
             snap_tried_cnt: 0,
+            scheduler: Mutex::new(scheduler),
         };
 
         store.applied_index = try!(store.load_applied_index(store.engine.as_ref()));
@@ -306,20 +313,15 @@ impl PeerStorage {
         if region.get_id() != region_id {
             return Err(box_err!("mismatch region id {} != {}", region_id, region.get_id()));
         }
-        let mut timer = Instant::now();
-        // Delete everything in the region for this peer.
-        try!(self.scan_region(self.engine.as_ref(),
-                              &mut |key, _| {
-                                  try!(w.delete(key));
-                                  Ok(true)
-                              }));
-        info!("clean old data takes {:?}", timer.elapsed());
-        timer = Instant::now();
-        // Write the snapshot into the region.
-        for kv in snap_data.get_data() {
-            try!(w.put(kv.get_key(), kv.get_value()));
-        }
-        info!("apply new data takes {:?}", timer.elapsed());
+
+
+        self.scheduler.lock().unwrap().schedule(SnapTask::Apply {
+            db: self.get_engine(),
+            ranges: self.region_key_ranges(),
+            snapshot: snap.clone(),
+        });
+
+
         // Restore the hard state
         match hard_state {
             None => try!(w.delete(&hard_state_key)),
@@ -650,17 +652,26 @@ mod test {
     use tempdir::*;
     use protobuf;
     use raftstore::store::bootstrap;
+    use util::worker::{Worker, Scheduler};
+    use raftstore::store::worker::{SnapTask, SnapRunner};
 
-    fn new_storage(path: &TempDir) -> RaftStorage {
+    fn new_scheduler() -> Scheduler<SnapTask> {
+        let mut snap_worker = Worker::new("snapshot worker");
+        snap_worker.start(SnapRunner).unwrap();
+        snap_worker.scheduler()
+    }
+
+    fn new_storage(path: &TempDir, scheduler: Scheduler<SnapTask>) -> RaftStorage {
         let db = DB::open_default(path.path().to_str().unwrap()).unwrap();
         let db = Arc::new(db);
         bootstrap::bootstrap_store(&db, 1, 1).expect("");
         let region = bootstrap::bootstrap_region(&db, 1, 1, 1).expect("");
-        RaftStorage::new(PeerStorage::new(db, &region).unwrap())
+        RaftStorage::new(PeerStorage::new(db, &region, scheduler).unwrap())
     }
 
     fn new_storage_from_ents(path: &TempDir, ents: &[Entry]) -> RaftStorage {
-        let store = new_storage(path);
+        let scheduler = new_scheduler();
+        let store = new_storage(path, scheduler);
         let wb = WriteBatch::new();
         let li = store.rl().append(&wb, 0, &ents[1..]).expect("");
         store.rl().engine.write(wb).expect("");
@@ -861,6 +872,7 @@ mod test {
         let mut cs = ConfState::new();
         cs.set_nodes(vec![1, 2, 3]);
 
+        let scheduler = new_scheduler();
         let td1 = TempDir::new("tikv-store-test").unwrap();
         let s1 = new_storage_from_ents(&td1, &ents);
         let snap1 = get_snap(&s1);
@@ -868,7 +880,7 @@ mod test {
         assert_eq!(s1.rl().truncated_state.get_term(), 3);
 
         let td2 = TempDir::new("tikv-store-test").unwrap();
-        let s2 = new_storage(&td2);
+        let s2 = new_storage(&td2, scheduler.clone());
         assert_eq!(s2.rl().first_index(), s2.rl().applied_index() + 1);
         let wb = WriteBatch::new();
         let res = s2.wl().apply_snapshot(&wb, &snap1).unwrap();

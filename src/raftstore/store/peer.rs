@@ -32,8 +32,10 @@ use raftstore::{Result, Error};
 use raftstore::coprocessor::CoprocessorHost;
 use raftstore::coprocessor::split_observer::SplitObserver;
 use util::{escape, HandyRwLock};
+use util::worker::{Worker, Scheduler};
 use pd::PdClient;
 use super::store::Store;
+use super::worker::SnapTask;
 use super::peer_storage::{self, PeerStorage, RaftStorage};
 use super::util;
 use super::msg::Callback;
@@ -191,7 +193,7 @@ impl Peer {
         }
 
         let store_id = store.store_id();
-        let ps = try!(PeerStorage::new(store.engine(), &region));
+        let ps = try!(PeerStorage::new(store.engine(), &region, store.get_snap_scheduler()));
         let applied_index = ps.applied_index();
         let storage = Arc::new(RaftStorage::new(ps));
 

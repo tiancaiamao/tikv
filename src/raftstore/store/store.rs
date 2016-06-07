@@ -35,7 +35,7 @@ use protobuf::Message;
 use raft::SnapshotStatus;
 use raftstore::{Result, Error};
 use kvproto::metapb;
-use util::worker::Worker;
+use util::worker::{Worker, Scheduler};
 use util::get_disk_stat;
 use super::worker::{SplitCheckRunner, SplitCheckTask, SnapTask, SnapRunner, CompactTask,
                     CompactRunner, PdRunner, PdTask};
@@ -180,6 +180,10 @@ impl<T: Transport, C: PdClient> Store<T, C> {
 
     pub fn get_sendch(&self) -> SendCh {
         self.sendch.clone()
+    }
+
+    pub fn get_snap_scheduler(&self) -> Scheduler<SnapTask> {
+        self.snap_worker.scheduler()
     }
 
     pub fn engine(&self) -> Arc<DB> {

@@ -118,10 +118,18 @@ mod test {
     use util::codec::number::NumberEncoder;
     use util::codec::bytes::encode_bytes;
     use byteorder::{BigEndian, WriteBytesExt};
+    use util::worker::{Worker, Scheduler};
+    use raftstore::store::worker::{SnapTask, SnapRunner};
 
-    fn new_peer_storage(path: &TempDir) -> PeerStorage {
+    fn new_scheduler() -> Scheduler<SnapTask> {
+        let mut snap_worker = Worker::new("snapshot worker");
+        snap_worker.start(SnapRunner).unwrap();
+        snap_worker.scheduler()
+    }
+
+    fn new_peer_storage(path: &TempDir, scheduler: Scheduler<SnapTask>) -> PeerStorage {
         let engine = new_engine(path.path().to_str().unwrap()).unwrap();
-        PeerStorage::new(Arc::new(engine), &Region::new()).unwrap()
+        PeerStorage::new(Arc::new(engine), &Region::new(), scheduler).unwrap()
     }
 
     fn new_split_request(key: &[u8]) -> AdminRequest {
@@ -162,8 +170,8 @@ mod test {
         let mut r = Region::new();
         r.set_id(10);
         r.set_start_key(region_start_key);
-
-        let ps = PeerStorage::new(Arc::new(engine), &r).unwrap();
+        let scheduler = new_scheduler();
+        let ps = PeerStorage::new(Arc::new(engine), &r, scheduler).unwrap();
         let mut ctx = ObserverContext::new(&ps);
         let mut observer = SplitObserver;
 
@@ -177,7 +185,8 @@ mod test {
     #[test]
     fn test_split() {
         let path = TempDir::new("test-raftstore").unwrap();
-        let storage = new_peer_storage(&path);
+        let scheduler = new_scheduler();
+        let storage = new_peer_storage(&path, scheduler);
         let mut ctx = ObserverContext::new(&storage);
         let mut req = AdminRequest::new();
 

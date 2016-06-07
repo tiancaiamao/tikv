@@ -210,6 +210,8 @@ mod tests {
     use raftstore::store::keys::*;
     use raftstore::store::PeerStorage;
     use storage::{Cursor, Key};
+    use util::worker::{Worker, Scheduler};
+    use raftstore::store::worker::{SnapTask, SnapRunner};
 
     use super::*;
     use std::sync::Arc;
@@ -217,13 +219,22 @@ mod tests {
 
     type DataSet = Vec<(Vec<u8>, Vec<u8>)>;
 
+    fn new_scheduler() -> Scheduler<SnapTask> {
+        let mut snap_worker = Worker::new("snapshot worker");
+        snap_worker.start(SnapRunner).unwrap();
+        snap_worker.scheduler()
+    }
+
     fn new_temp_engine(path: &TempDir) -> Arc<DB> {
         let engine = new_engine(path.path().to_str().unwrap()).unwrap();
         Arc::new(engine)
     }
 
-    fn new_peer_storage(engine: Arc<DB>, r: &Region) -> PeerStorage {
-        PeerStorage::new(engine, r).unwrap()
+    fn new_peer_storage(engine: Arc<DB>,
+                        r: &Region,
+                        scheduler: Scheduler<SnapTask>)
+                        -> PeerStorage {
+        PeerStorage::new(engine, r, scheduler).unwrap()
     }
 
     fn new_snapshot(peer_storage: &PeerStorage) -> RegionSnapshot {
@@ -246,7 +257,8 @@ mod tests {
         for &(ref k, ref v) in &base_data {
             engine.put(&data_key(k), v).expect("");
         }
-        let store = new_peer_storage(engine.clone(), &r);
+        let scheduler = new_scheduler();
+        let store = new_peer_storage(engine.clone(), &r, scheduler);
         (store, base_data)
     }
 
@@ -258,7 +270,8 @@ mod tests {
         r.set_id(10);
         r.set_start_key(b"key0".to_vec());
         r.set_end_key(b"key4".to_vec());
-        let store = new_peer_storage(engine.clone(), &r);
+        let scheduler = new_scheduler();
+        let store = new_peer_storage(engine.clone(), &r, scheduler);
 
         let (key1, value1) = (b"key1", 2u64);
         engine.put_u64(&data_key(key1), value1).expect("");
@@ -331,8 +344,9 @@ mod tests {
         }
         assert_eq!(res, base_data[1..3].to_vec());
 
+        let scheduler = new_scheduler();
         // test last region
-        let store = new_peer_storage(engine.clone(), &Region::new());
+        let store = new_peer_storage(engine.clone(), &Region::new(), scheduler);
         let snap = RegionSnapshot::new(&store);
         data.clear();
         snap.scan(b"",
@@ -392,7 +406,8 @@ mod tests {
         assert_eq!(res, expect);
 
         // test last region
-        let store = new_peer_storage(engine.clone(), &Region::new());
+        let scheduler = new_scheduler();
+        let store = new_peer_storage(engine.clone(), &Region::new(), scheduler);
         let snap = RegionSnapshot::new(&store);
         let mut iter = snap.iter();
         assert!(!iter.reverse_seek(&Key::from_encoded(b"a1".to_vec())).unwrap());
