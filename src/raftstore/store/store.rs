@@ -25,7 +25,7 @@ use protobuf;
 use uuid::Uuid;
 
 use kvproto::raft_serverpb::{RaftMessage, StoreIdent, RaftSnapshotData, RaftTruncatedState};
-use kvproto::raftpb::ConfChangeType;
+use kvproto::raftpb::{ConfChangeType, Snapshot};
 use kvproto::pdpb::StoreStats;
 use util::{HandyRwLock, SlowTimer};
 use pd::PdClient;
@@ -38,14 +38,14 @@ use kvproto::metapb;
 use util::worker::Worker;
 use util::get_disk_stat;
 use super::worker::{SplitCheckRunner, SplitCheckTask, SnapTask, SnapRunner, CompactTask,
-                    CompactRunner, PdRunner, PdTask};
+                    CompactRunner, PdRunner, PdTask, SnapApplyTask, SnapApplyRunner};
 use super::util;
 use super::{SendCh, Msg, Tick};
 use super::keys::{self, enc_start_key, enc_end_key};
 use super::engine::{Peekable, Iterable};
 use super::config::Config;
 use super::peer::{Peer, PendingCmd, ReadyResult, ExecResult};
-use super::peer_storage::SnapState;
+use super::peer_storage::{SnapState, SnapApplyState};
 use super::msg::Callback;
 use super::cmd_resp::{bind_uuid, bind_term, bind_error};
 use super::transport::Transport;
@@ -71,6 +71,7 @@ pub struct Store<T: Transport, C: PdClient + 'static> {
     snap_worker: Worker<SnapTask>,
     compact_worker: Worker<CompactTask>,
     pd_worker: Worker<PdTask>,
+    snap_apply_worker: Worker<SnapApplyTask>,
 
     /// A flag indicates whether store has been shutdown.
     stopped: Arc<RwLock<bool>>,
@@ -116,6 +117,7 @@ impl<T: Transport, C: PdClient> Store<T, C> {
             pending_raft_groups: HashSet::new(),
             split_check_worker: Worker::new("split check worker"),
             snap_worker: Worker::new("snapshot worker"),
+            snap_apply_worker: Worker::new("snapshot apply worker"),
             compact_worker: Worker::new("compact worker"),
             pd_worker: Worker::new("pd worker"),
             region_ranges: BTreeMap::new(),
@@ -169,6 +171,8 @@ impl<T: Transport, C: PdClient> Store<T, C> {
 
         box_try!(self.snap_worker.start(SnapRunner));
 
+        box_try!(self.snap_apply_worker.start(SnapApplyRunner));
+
         box_try!(self.compact_worker.start(CompactRunner));
 
         let pd_runner = PdRunner::new(self.pd_client.clone(), self.sendch.clone());
@@ -208,12 +212,13 @@ impl<T: Transport, C: PdClient> Store<T, C> {
     }
 
     fn on_raft_base_tick(&mut self, event_loop: &mut EventLoop<Self>) {
+        let mut buf: Vec<(u64, ReadyResult)> = vec![];
         for (region_id, peer) in &mut self.region_peers {
             peer.raft_group.tick();
             self.pending_raft_groups.insert(*region_id);
             // ALERT!!! patern matching won't release lock here.
             if peer.is_leader() && SnapState::Pending == peer.storage.rl().snap_state {
-                debug!("handling snapshot for {}", region_id);
+                debug!("generating snapshot for {}", region_id);
                 let task = SnapTask::new(peer.storage.clone());
                 debug!("task generated");
                 peer.storage.wl().snap_state = SnapState::Generating;
@@ -221,6 +226,40 @@ impl<T: Transport, C: PdClient> Store<T, C> {
                     error!("failed to schedule snap task {}", e);
                     peer.storage.wl().snap_state = SnapState::Failed;
                 }
+            }
+
+            let mut snapshot: Option<Snapshot> = None;
+            match peer.storage.rl().snap_applying {
+                SnapApplyState::Pending(ref data) => snapshot = Some(data.clone()),
+                SnapApplyState::Success(region_id, ref data) => {
+                    print!("snap apply state: success");
+                    let ready_result = ReadyResult {
+                        exec_results: vec![],
+                        snap_applied_region: Some(data.region.clone()),
+                    };
+                    buf.push((region_id, ready_result));
+                    peer.storage.wl().snap_applying = SnapApplyState::Relax;
+                }
+                _ => {}
+            }
+
+            if let Some(data) = snapshot {
+                let task = SnapApplyTask::new(data, peer.storage.clone());
+                print!("raft tick, send state to applying\n");
+                peer.storage.wl().snap_applying = SnapApplyState::Applying;
+                if let Err(e) = self.snap_apply_worker.schedule(task) {
+                    error!("failed to schedule snapshot apply task {}", e);
+                    peer.storage.wl().snap_applying = SnapApplyState::Failed;
+                }
+            }
+        }
+
+        for (region_id, ready_result) in buf {
+            print!("on ready result {}\n", region_id);
+            if let Err(e) = self.on_ready_result(region_id, ready_result) {
+                error!("handle raft ready result at region {} err: {:?}",
+                       region_id,
+                       e);
             }
         }
 

@@ -15,8 +15,10 @@ mod snap;
 mod split_check;
 mod compact;
 mod pd;
+mod snap_apply;
 
 pub use self::snap::{Task as SnapTask, Runner as SnapRunner};
+pub use self::snap_apply::{Task as SnapApplyTask, Runner as SnapApplyRunner};
 pub use self::split_check::{Task as SplitCheckTask, Runner as SplitCheckRunner};
 pub use self::compact::{Task as CompactTask, Runner as CompactRunner};
 pub use self::pd::{Task as PdTask, Runner as PdRunner};

@@ -14,7 +14,6 @@
 use std::sync::{self, Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::vec::Vec;
 use std::{error, mem};
-use std::time::Instant;
 
 use rocksdb::{DB, WriteBatch, Writable};
 use rocksdb::rocksdb::Snapshot as RocksDbSnapshot;
@@ -44,6 +43,14 @@ pub enum SnapState {
     Failed,
 }
 
+pub enum SnapApplyState {
+    Relax,
+    Pending(Snapshot),
+    Applying,
+    Success(u64, ApplySnapResult),
+    Failed,
+}
+
 pub struct PeerStorage {
     engine: Arc<DB>,
 
@@ -55,6 +62,7 @@ pub struct PeerStorage {
     // 2, a dummy entry for the start point of the empty log.
     pub truncated_state: RaftTruncatedState,
     pub snap_state: SnapState,
+    pub snap_applying: SnapApplyState,
     snap_tried_cnt: u8,
 }
 
@@ -92,6 +100,7 @@ impl PeerStorage {
             applied_index: 0,
             truncated_state: RaftTruncatedState::new(),
             snap_state: SnapState::Relax,
+            snap_applying: SnapApplyState::Relax,
             snap_tried_cnt: 0,
         };
 
@@ -287,63 +296,13 @@ impl PeerStorage {
     }
 
     // Apply the peer with given snapshot.
-    pub fn apply_snapshot<T: Mutable>(&self, w: &T, snap: &Snapshot) -> Result<ApplySnapResult> {
-        info!("begin to apply snapshot for region {}",
-              self.get_region_id());
-
-        let mut snap_data = RaftSnapshotData::new();
-        try!(snap_data.merge_from_bytes(snap.get_data()));
-
-        let region_id = self.get_region_id();
-
-        // Apply snapshot should not overwrite current hard state which
-        // records the previous vote.
-        // TODO: maybe exclude hard state when do snapshot.
-        let hard_state_key = keys::raft_hard_state_key(region_id);
-        let hard_state: Option<HardState> = try!(self.engine.get_msg(&hard_state_key));
-
-        let region = snap_data.get_region();
-        if region.get_id() != region_id {
-            return Err(box_err!("mismatch region id {} != {}", region_id, region.get_id()));
+    pub fn apply_snapshot(&mut self, snap: &Snapshot) {
+        if let SnapApplyState::Relax = self.snap_applying {
+            print!("apply_snapshot set state to pending\n");
+            self.snap_applying = SnapApplyState::Pending(snap.clone());
+        } else {
+            print!("already applying snapshot\n");
         }
-        let mut timer = Instant::now();
-        // Delete everything in the region for this peer.
-        try!(self.scan_region(self.engine.as_ref(),
-                              &mut |key, _| {
-                                  try!(w.delete(key));
-                                  Ok(true)
-                              }));
-        info!("clean old data takes {:?}", timer.elapsed());
-        timer = Instant::now();
-        // Write the snapshot into the region.
-        for kv in snap_data.get_data() {
-            try!(w.put(kv.get_key(), kv.get_value()));
-        }
-        info!("apply new data takes {:?}", timer.elapsed());
-        // Restore the hard state
-        match hard_state {
-            None => try!(w.delete(&hard_state_key)),
-            Some(state) => try!(w.put_msg(&hard_state_key, &state)),
-        }
-
-        let last_index = snap.get_metadata().get_index();
-        try!(save_last_index(w, region_id, last_index));
-
-        // The snapshot only contains log which index > applied index, so
-        // here the truncate state's (index, term) is in snapshot metadata.
-        let mut truncated_state = RaftTruncatedState::new();
-        truncated_state.set_index(last_index);
-        truncated_state.set_term(snap.get_metadata().get_term());
-        try!(save_truncated_state(w, region_id, &truncated_state));
-
-        info!("apply snapshot ok for region {}", self.get_region_id());
-
-        Ok(ApplySnapResult {
-            last_index: last_index,
-            applied_index: last_index,
-            region: region.clone(),
-            truncated_state: truncated_state,
-        })
     }
 
     // Discard all log entries prior to compact_index. We must guarantee
@@ -471,14 +430,11 @@ impl PeerStorage {
     pub fn handle_raft_ready(&mut self, ready: &Ready) -> Result<Option<metapb::Region>> {
         let wb = WriteBatch::new();
         let mut last_index = self.last_index();
-        let mut apply_snap_res = None;
+        // let mut apply_snap_res = None;
         let region_id = self.get_region_id();
         if !raft::is_empty_snap(&ready.snapshot) {
             try!(wb.delete(&keys::region_tombstone_key(region_id)));
-            apply_snap_res = try!(self.apply_snapshot(&wb, &ready.snapshot).map(|res| {
-                last_index = res.last_index;
-                Some(res)
-            }));
+            self.apply_snapshot(&ready.snapshot);
         }
         if !ready.entries.is_empty() {
             last_index = try!(self.append(&wb, last_index, &ready.entries));
@@ -491,14 +447,6 @@ impl PeerStorage {
         try!(self.engine.write(wb));
 
         self.set_last_index(last_index);
-        // If we apply snapshot ok, we should update some infos like applied index too.
-        if let Some(res) = apply_snap_res {
-            self.set_applied_index(res.applied_index);
-            self.set_region(&res.region);
-            self.set_truncated_state(&res.truncated_state);
-            return Ok(Some(res.region.clone()));
-        }
-
         Ok(None)
     }
 }
@@ -870,12 +818,12 @@ mod test {
         let td2 = TempDir::new("tikv-store-test").unwrap();
         let s2 = new_storage(&td2);
         assert_eq!(s2.rl().first_index(), s2.rl().applied_index() + 1);
-        let wb = WriteBatch::new();
-        let res = s2.wl().apply_snapshot(&wb, &snap1).unwrap();
-        assert_eq!(res.applied_index, 5);
-        assert_eq!(res.last_index, 5);
-        assert_eq!(res.truncated_state.get_index(), 5);
-        assert_eq!(res.truncated_state.get_term(), 5);
-        assert_eq!(s2.rl().first_index(), s2.rl().applied_index() + 1);
+        // let wb = WriteBatch::new();
+        s2.wl().apply_snapshot(&snap1);
+        // assert_eq!(res.applied_index, 5);
+        // assert_eq!(res.last_index, 5);
+        // assert_eq!(res.truncated_state.get_index(), 5);
+        // assert_eq!(res.truncated_state.get_term(), 5);
+        // assert_eq!(s2.rl().first_index(), s2.rl().applied_index() + 1);
     }
 }
