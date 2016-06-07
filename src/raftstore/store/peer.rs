@@ -298,7 +298,7 @@ impl Peer {
                self.peer,
                self.region_id);
 
-        let ready = self.raft_group.ready();
+        let mut ready = self.raft_group.ready();
 
         let applied_region = try!(self.storage.wl().handle_raft_ready(&ready));
 
@@ -306,7 +306,16 @@ impl Peer {
             try!(self.send_raft_message(&msg, trans));
         }
 
-        let exec_results = try!(self.handle_raft_commit_entries(&ready.committed_entries));
+        let allow_apply = self.storage.rl().snap_state.allow_apply_committed();
+        let exec_results = if allow_apply {
+            try!(self.handle_raft_commit_entries(&ready.committed_entries))
+        } else {
+            if let Some(ref mut hs) = ready.hs {
+                // Don't apply here.
+                hs.set_commit(0);
+            }
+            vec![]
+        };
 
         self.raft_group.advance(ready);
         Ok(Some(ReadyResult {

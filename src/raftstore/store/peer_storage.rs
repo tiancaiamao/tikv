@@ -14,7 +14,6 @@
 use std::sync::{self, Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::vec::Vec;
 use std::{error, mem};
-use std::time::Instant;
 
 use rocksdb::{DB, WriteBatch, Writable};
 use rocksdb::rocksdb::Snapshot as RocksDbSnapshot;
@@ -39,9 +38,39 @@ const MAX_SNAP_TRY_CNT: u8 = 5;
 pub enum SnapState {
     Relax,
     Pending,
+    Waiting(Snapshot),
+    Applying,
     Generating,
     Snap(Snapshot),
     Failed,
+}
+
+impl SnapState {
+    pub fn is_waiting(&self) -> bool {
+        if let SnapState::Waiting(_) = *self {
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn turn_to_apply(&mut self) -> Option<Snapshot> {
+        if !self.is_waiting() {
+            return None;
+        }
+        match mem::replace(self, SnapState::Applying) {
+            SnapState::Waiting(s) => Some(s),
+            _ => unreachable!(),
+        }
+    }
+
+    pub fn allow_apply_committed(&self) -> bool {
+        match *self {
+            SnapState::Waiting(_) |
+            SnapState::Applying => false,
+            _ => true,
+        }
+    }
 }
 
 pub struct PeerStorage {
@@ -294,36 +323,14 @@ impl PeerStorage {
         let mut snap_data = RaftSnapshotData::new();
         try!(snap_data.merge_from_bytes(snap.get_data()));
 
-        let region_id = self.get_region_id();
+        let mut snap_data = RaftSnapshotData::new();
+        box_try!(snap_data.merge_from_bytes(snap.get_data()));
 
-        // Apply snapshot should not overwrite current hard state which
-        // records the previous vote.
-        // TODO: maybe exclude hard state when do snapshot.
-        let hard_state_key = keys::raft_hard_state_key(region_id);
-        let hard_state: Option<HardState> = try!(self.engine.get_msg(&hard_state_key));
+        let region_id = self.get_region_id();
 
         let region = snap_data.get_region();
         if region.get_id() != region_id {
             return Err(box_err!("mismatch region id {} != {}", region_id, region.get_id()));
-        }
-        let mut timer = Instant::now();
-        // Delete everything in the region for this peer.
-        try!(self.scan_region(self.engine.as_ref(),
-                              &mut |key, _| {
-                                  try!(w.delete(key));
-                                  Ok(true)
-                              }));
-        info!("clean old data takes {:?}", timer.elapsed());
-        timer = Instant::now();
-        // Write the snapshot into the region.
-        for kv in snap_data.get_data() {
-            try!(w.put(kv.get_key(), kv.get_value()));
-        }
-        info!("apply new data takes {:?}", timer.elapsed());
-        // Restore the hard state
-        match hard_state {
-            None => try!(w.delete(&hard_state_key)),
-            Some(state) => try!(w.put_msg(&hard_state_key, &state)),
         }
 
         let last_index = snap.get_metadata().get_index();
@@ -493,6 +500,7 @@ impl PeerStorage {
         self.set_last_index(last_index);
         // If we apply snapshot ok, we should update some infos like applied index too.
         if let Some(res) = apply_snap_res {
+            self.snap_state = SnapState::Waiting(ready.snapshot.clone());
             self.set_applied_index(res.applied_index);
             self.set_region(&res.region);
             self.set_truncated_state(&res.truncated_state);

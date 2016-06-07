@@ -18,22 +18,26 @@ use std::fmt::{self, Formatter, Display};
 use std::error;
 use std::time::Instant;
 
+use rocksdb::{WriteBatch, Writable};
+use kvproto::raft_serverpb::RaftSnapshotData;
+use kvproto::raftpb::Snapshot;
+use raftstore::store::keys;
+use protobuf::Message;
+
 use util::worker::Runnable;
 
 /// Snapshot generating task.
-pub struct Task {
-    storage: Arc<RaftStorage>,
-}
-
-impl Task {
-    pub fn new(storage: Arc<RaftStorage>) -> Task {
-        Task { storage: storage }
-    }
+pub enum Task {
+    Gen(Arc<RaftStorage>),
+    Apply(Arc<RaftStorage>, Snapshot),
 }
 
 impl Display for Task {
     fn fmt(&self, f: &mut Formatter) -> fmt::Result {
-        write!(f, "Snapshot Task for {}", self.storage.rl().get_region_id())
+        match *self {
+            Task::Gen(ref s) => write!(f, "Gen snap for {}", s.rl().get_region_id()),
+            Task::Apply(ref s, _) => write!(f, "Apply snap for {}", s.rl().get_region_id()),
+        }
     }
 }
 
@@ -52,9 +56,9 @@ quick_error! {
 pub struct Runner;
 
 impl Runner {
-    fn generate_snap(&self, task: &Task) -> Result<(), Error> {
+    fn generate_snap(&self, storage: &RaftStorage) -> Result<(), Error> {
         // do we need to check leader here?
-        let db = task.storage.rl().get_engine();
+        let db = storage.rl().get_engine();
         let raw_snap;
         let region_id;
         let ranges;
@@ -62,7 +66,7 @@ impl Runner {
         let term;
 
         {
-            let storage = task.storage.rl();
+            let storage = storage.rl();
             raw_snap = db.snapshot();
             region_id = storage.get_region_id();
             ranges = storage.region_key_ranges();
@@ -71,21 +75,62 @@ impl Runner {
         }
 
         let snap = box_try!(store::do_snapshot(&raw_snap, region_id, ranges, applied_idx, term));
-        task.storage.wl().snap_state = SnapState::Snap(snap);
+        storage.wl().snap_state = SnapState::Snap(snap);
+        Ok(())
+    }
+
+    fn apply_snap(&self, storage: &RaftStorage, snap: Snapshot) -> Result<(), Error> {
+        let mut snap_data = RaftSnapshotData::new();
+        box_try!(snap_data.merge_from_bytes(snap.get_data()));
+
+        let engine = storage.rl().get_engine();
+
+        // Async apply snapshot should not skip region data.
+        let mut timer = Instant::now();
+        // Delete everything in the region for this peer.
+        let w = WriteBatch::new();
+        box_try!(storage.rl().scan_region(engine.as_ref(),
+                                          &mut |key, _| {
+                                              if key.starts_with(keys::DATA_PREFIX_KEY) {
+                                                  try!(w.delete(key));
+                                              }
+                                              Ok(true)
+                                          }));
+        info!("clean old data takes {:?}", timer.elapsed());
+        timer = Instant::now();
+        // Write the snapshot into the region.
+        for kv in snap_data.get_data() {
+            if kv.get_key().starts_with(keys::DATA_PREFIX_KEY) {
+                box_try!(w.put(kv.get_key(), kv.get_value()));
+            }
+        }
+
+        box_try!(engine.write(w));
+        info!("apply new data takes {:?}", timer.elapsed());
         Ok(())
     }
 }
 
 impl Runnable<Task> for Runner {
     fn run(&mut self, task: Task) {
-        metric_incr!("raftstore.generate_snap");
-        let ts = Instant::now();
-        if let Err(e) = self.generate_snap(&task) {
-            error!("failed to generate snap: {:?}!!!", e);
-            task.storage.wl().snap_state = SnapState::Failed;
-            return;
+        match task {
+            Task::Gen(s) => {
+                metric_incr!("raftstore.generate_snap");
+                let ts = Instant::now();
+                if let Err(e) = self.generate_snap(&s) {
+                    error!("failed to generate snap: {:?}!!!", e);
+                    s.wl().snap_state = SnapState::Failed;
+                    return;
+                }
+                metric_incr!("raftstore.generate_snap.success");
+                metric_time!("raftstore.generate_snap.cost", ts.elapsed());
+            }
+            Task::Apply(s, snap) => {
+                if let Err(e) = self.apply_snap(&s, snap) {
+                    error!("failed to apply snap: {:?}", e);
+                }
+                s.wl().snap_state = SnapState::Relax;
+            }
         }
-        metric_incr!("raftstore.generate_snap.success");
-        metric_time!("raftstore.generate_snap.cost", ts.elapsed());
     }
 }

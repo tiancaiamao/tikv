@@ -212,14 +212,26 @@ impl<T: Transport, C: PdClient> Store<T, C> {
             peer.raft_group.tick();
             self.pending_raft_groups.insert(*region_id);
             // ALERT!!! patern matching won't release lock here.
-            if peer.is_leader() && SnapState::Pending == peer.storage.rl().snap_state {
-                debug!("handling snapshot for {}", region_id);
-                let task = SnapTask::new(peer.storage.clone());
+            if peer.is_leader() {
+                if SnapState::Pending == peer.storage.rl().snap_state {
+                    debug!("handling snapshot for {}", region_id);
+                    let task = SnapTask::Gen(peer.storage.clone());
+                    debug!("task generated");
+                    peer.storage.wl().snap_state = SnapState::Generating;
+                    if let Err(e) = self.snap_worker.schedule(task) {
+                        error!("failed to schedule snap task {}", e);
+                        peer.storage.wl().snap_state = SnapState::Failed;
+                    }
+                }
+            } else if peer.storage.rl().snap_state.is_waiting() {
+                debug!("apply snapshot for {}", region_id);
+                let task = SnapTask::Apply(peer.storage.clone(),
+                                           peer.storage.wl().snap_state.turn_to_apply().unwrap());
                 debug!("task generated");
-                peer.storage.wl().snap_state = SnapState::Generating;
                 if let Err(e) = self.snap_worker.schedule(task) {
                     error!("failed to schedule snap task {}", e);
-                    peer.storage.wl().snap_state = SnapState::Failed;
+                    // TODO: destroy this peer.
+                    peer.storage.wl().snap_state = SnapState::Relax;
                 }
             }
         }
