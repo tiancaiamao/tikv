@@ -78,10 +78,10 @@ impl Runnable<Task> for Runner {
         {
             let peer_storage = task.storage.wl();
             peer_storage.scan_region(db.as_ref(),
-                                     &mut |key, _| {
-                                         w.delete(key).unwrap();
-                                         Ok(true)
-                                     })
+                             &mut |key, _| {
+                                 w.delete(key).unwrap();
+                                 Ok(true)
+                             })
                 .unwrap();
         }
         info!("clean old data takes {:?}", timer.elapsed());
@@ -101,31 +101,14 @@ impl Runnable<Task> for Runner {
             }
         }
 
-        let last_index = snap.get_metadata().get_index();
-        save_last_index(&w, region_id, last_index).unwrap();
-
-        // The snapshot only contains log which index > applied index, so
-        // here the truncate state's (index, term) is in snapshot metadata.
-        let mut truncated_state = RaftTruncatedState::new();
-        truncated_state.set_index(last_index);
-        truncated_state.set_term(snap.get_metadata().get_term());
-        save_truncated_state(&w, region_id, &truncated_state).unwrap();
-
         db.write(w).unwrap();
         print!("apply snapshot ok for region {}\n", region_id);
 
-        let apply_snap_res = ApplySnapResult {
-            last_index: last_index,
-            applied_index: last_index,
-            region: region.clone(),
-            truncated_state: truncated_state,
-        };
-
         // If we apply snapshot ok, we should update some infos like applied index too.
-        task.storage.wl().set_applied_index(apply_snap_res.applied_index);
-        task.storage.wl().set_region(&apply_snap_res.region);
-        task.storage.wl().set_truncated_state(&apply_snap_res.truncated_state);
-        task.storage.wl().snap_applying = SnapApplyState::Success(region_id, apply_snap_res);
+        let last_index = snap.get_metadata().get_index();
+        task.storage.wl().set_applied_index(last_index);
+        task.storage.wl().set_region(&region);
+        task.storage.wl().snap_applying = SnapApplyState::Success(region.clone());
         print!("not dead lock!!!\n");
     }
 }

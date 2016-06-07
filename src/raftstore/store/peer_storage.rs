@@ -21,6 +21,7 @@ use protobuf::{self, Message};
 
 use kvproto::metapb;
 use kvproto::raftpb::{Entry, Snapshot, HardState, ConfState};
+use kvproto::metapb::Region;
 use kvproto::raft_serverpb::{RaftSnapshotData, KeyValue, RaftTruncatedState};
 use util::HandyRwLock;
 use raft::{self, Storage, RaftState, StorageError, Error as RaftError, Ready};
@@ -47,7 +48,7 @@ pub enum SnapApplyState {
     Relax,
     Pending(Snapshot),
     Applying,
-    Success(u64, ApplySnapResult),
+    Success(Region),
     Failed,
 }
 
@@ -296,13 +297,26 @@ impl PeerStorage {
     }
 
     // Apply the peer with given snapshot.
-    pub fn apply_snapshot(&mut self, snap: &Snapshot) {
+    pub fn apply_snapshot<T: Mutable>(&mut self, w: &T, snap: &Snapshot) -> Result<u64> {
+        let last_index = snap.get_metadata().get_index();
+        let region_id = self.get_region_id();
+        try!(save_last_index(w, region_id, last_index));
+
+        // The snapshot only contains log which index > applied index, so
+        // here the truncate state's (index, term) is in snapshot metadata.
+        let mut truncated_state = RaftTruncatedState::new();
+        truncated_state.set_index(last_index);
+        truncated_state.set_term(snap.get_metadata().get_term());
+        try!(save_truncated_state(w, region_id, &truncated_state));
+
         if let SnapApplyState::Relax = self.snap_applying {
             print!("apply_snapshot set state to pending\n");
             self.snap_applying = SnapApplyState::Pending(snap.clone());
         } else {
             print!("already applying snapshot\n");
         }
+
+        Ok(last_index)
     }
 
     // Discard all log entries prior to compact_index. We must guarantee
@@ -430,18 +444,20 @@ impl PeerStorage {
     pub fn handle_raft_ready(&mut self, ready: &Ready) -> Result<Option<metapb::Region>> {
         let wb = WriteBatch::new();
         let mut last_index = self.last_index();
-        // let mut apply_snap_res = None;
         let region_id = self.get_region_id();
         if !raft::is_empty_snap(&ready.snapshot) {
             try!(wb.delete(&keys::region_tombstone_key(region_id)));
-            self.apply_snapshot(&ready.snapshot);
+            last_index = try!(self.apply_snapshot(&wb, &ready.snapshot));
+            print!("store snapshot, save last index: {}\n", last_index);
         }
         if !ready.entries.is_empty() {
             last_index = try!(self.append(&wb, last_index, &ready.entries));
+            print!("store entries, append last index: {}\n", last_index);
         }
 
         if let Some(ref hs) = ready.hs {
             try!(save_hard_state(&wb, region_id, hs));
+            print!("store hard stat, {:?}\n", hs);
         }
 
         try!(self.engine.write(wb));
@@ -818,8 +834,8 @@ mod test {
         let td2 = TempDir::new("tikv-store-test").unwrap();
         let s2 = new_storage(&td2);
         assert_eq!(s2.rl().first_index(), s2.rl().applied_index() + 1);
-        // let wb = WriteBatch::new();
-        s2.wl().apply_snapshot(&snap1);
+        let wb = WriteBatch::new();
+        s2.wl().apply_snapshot(&wb, &snap1).unwrap();
         // assert_eq!(res.applied_index, 5);
         // assert_eq!(res.last_index, 5);
         // assert_eq!(res.truncated_state.get_index(), 5);

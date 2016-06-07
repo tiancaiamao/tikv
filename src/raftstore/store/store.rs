@@ -231,13 +231,13 @@ impl<T: Transport, C: PdClient> Store<T, C> {
             let mut snapshot: Option<Snapshot> = None;
             match peer.storage.rl().snap_applying {
                 SnapApplyState::Pending(ref data) => snapshot = Some(data.clone()),
-                SnapApplyState::Success(region_id, ref data) => {
+                SnapApplyState::Success(ref region) => {
                     print!("snap apply state: success");
                     let ready_result = ReadyResult {
                         exec_results: vec![],
-                        snap_applied_region: Some(data.region.clone()),
+                        snap_applied_region: Some(region.clone()),
                     };
-                    buf.push((region_id, ready_result));
+                    buf.push((region.get_id(), ready_result));
                     peer.storage.wl().snap_applying = SnapApplyState::Relax;
                 }
                 _ => {}

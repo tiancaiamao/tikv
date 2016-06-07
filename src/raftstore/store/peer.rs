@@ -685,6 +685,7 @@ impl Peer {
         }
 
         let last_applied_index = self.storage.rl().applied_index();
+        print!("apply raft cmd: last applied index = {}\n", last_applied_index);
         if last_applied_index >= index {
             return Err(box_err!("applied index moved backwards, {} >= {}",
                                 last_applied_index,
