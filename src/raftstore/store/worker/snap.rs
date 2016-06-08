@@ -17,6 +17,7 @@ use std::sync::Arc;
 use std::fmt::{self, Formatter, Display};
 use std::error;
 use std::time::Instant;
+use std::path::PathBuf;
 
 use rocksdb::{WriteBatch, Writable};
 use kvproto::raft_serverpb::RaftSnapshotData;
@@ -53,10 +54,16 @@ quick_error! {
     }
 }
 
-pub struct Runner;
+pub struct Runner {
+    snap_dir: PathBuf,
+}
 
 impl Runner {
-    fn generate_snap(&self, storage: &RaftStorage) -> Result<(), Error> {
+    pub fn new<T: Into<PathBuf>>(snap_dir: T) -> Runner {
+        Runner { snap_dir: snap_dir.into() }
+    }
+
+    fn generate_snap(&self, task: &Task) -> Result<(), Error> {
         // do we need to check leader here?
         let db = storage.rl().get_engine();
         let raw_snap;
@@ -74,12 +81,54 @@ impl Runner {
             term = box_try!(storage.term(applied_idx));
         }
 
-        let snap = box_try!(store::do_snapshot(&raw_snap, region_id, ranges, applied_idx, term));
-        storage.wl().snap_state = SnapState::Snap(snap);
+        let snap = box_try!(store::do_snapshot(self.snap_dir.as_path(),
+                                               &raw_snap,
+                                               region_id,
+                                               ranges,
+                                               applied_idx,
+                                               term));
+        task.storage.wl().snap_state = SnapState::Snap(snap);
         Ok(())
     }
 
     fn apply_snap(&self, storage: &RaftStorage, snap: Snapshot) -> Result<(), Error> {
+        // let mut snap_file = try!(SnapFile::from_snap(self.snap_dir.clone(), snap, SNAP_REV_PREFIX));
+        // snap_file.delete_when_drop();
+        // if !snap_file.exists() {
+        //     return Err(box_err!("missing snap file {}", snap_file.path().display()));
+        // }
+        // let mut reader = try!(File::open(snap_file.path()));
+        // let len = try!(reader.decode_u64());
+        // // do we need to check RaftMsg here?
+        // try!(reader.seek(SeekFrom::Current(len as i64)));
+
+        // let mut timer = Instant::now();
+        // // Delete everything in the region for this peer.
+        // try!(self.scan_region(self.engine.as_ref(),
+        //                       &mut |key, _| {
+        //                           try!(w.delete(key));
+        //                           Ok(true)
+        //                       }));
+        // info!("clean old data takes {:?}", timer.elapsed());
+        // timer = Instant::now();
+        // // Write the snapshot into the region.
+        // loop {
+        //     // TODO: avoid too many allocation
+        //     let key = try!(reader.decode_compact_bytes());
+        //     if key.is_empty() {
+        //         break;
+        //     }
+        //     let value = try!(reader.decode_compact_bytes());
+        //     try!(w.put(&key, &value));
+        // }
+        // info!("apply new data takes {:?}", timer.elapsed());
+
+        // // Restore the hard state
+        //     match hard_state {
+        //         None => try!(w.delete(&hard_state_key)),
+        //         Some(state) => try!(w.put_msg(&hard_state_key, &state)),
+        //     }
+
         let mut snap_data = RaftSnapshotData::new();
         box_try!(snap_data.merge_from_bytes(snap.get_data()));
 
