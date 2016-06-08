@@ -323,9 +323,6 @@ impl PeerStorage {
         let mut snap_data = RaftSnapshotData::new();
         try!(snap_data.merge_from_bytes(snap.get_data()));
 
-        let mut snap_data = RaftSnapshotData::new();
-        box_try!(snap_data.merge_from_bytes(snap.get_data()));
-
         let region_id = self.get_region_id();
 
         let region = snap_data.get_region();
