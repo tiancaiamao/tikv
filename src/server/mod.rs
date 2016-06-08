@@ -133,6 +133,7 @@ impl Display for ConnData {
                        self.msg_id,
                        self.msg.get_kv_resp().get_field_type())
             }
+            MessageType::Snapshot => write!(f, "[{}] snapshot request", self.msg_id),
             MessageType::CopReq => write!(f, "[{}] coprocessor request", self.msg_id),
             MessageType::CopResp => write!(f, "[{}] coprocessor response", self.msg_id),
             MessageType::PdReq => write!(f, "[{}] pd request", self.msg_id),

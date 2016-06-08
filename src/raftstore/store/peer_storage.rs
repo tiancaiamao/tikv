@@ -29,8 +29,6 @@ use kvproto::raftpb::{Entry, Snapshot, HardState, ConfState};
 use kvproto::raft_serverpb::{RaftSnapshotData, RaftTruncatedState};
 use util::HandyRwLock;
 use util::codec::bytes::BytesEncoder;
-use util::codec::bytes::CompactBytesDecoder;
-use util::codec::number::NumberDecoder;
 use raft::{self, Storage, RaftState, StorageError, Error as RaftError, Ready};
 use raftstore::{Result, Error};
 use super::keys::{self, enc_start_key, enc_end_key};
@@ -266,6 +264,10 @@ impl PeerStorage {
 
     pub fn get_region(&self) -> &metapb::Region {
         &self.region
+    }
+
+    pub fn get_snap_dir(&self) -> String {
+        self.snap_dir.clone()
     }
 
     pub fn raw_snapshot(&self) -> RocksDbSnapshot {
